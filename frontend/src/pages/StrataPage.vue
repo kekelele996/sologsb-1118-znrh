@@ -11,6 +11,7 @@ import { stratumStore } from '@/stores/stratumStore'
 import { trenchStore } from '@/stores/trenchStore'
 import { artifactStore } from '@/stores/artifactStore'
 import { relationStore } from '@/stores/relationStore'
+import { previewTrenchShift } from '@/utils/depthShift'
 import { uid } from '@/utils/id'
 
 const trenchState = useStore(trenchStore)
@@ -193,6 +194,44 @@ async function applyBatchType(): Promise<void> {
   await stratumStore.getState().bulkSetType(selectedIds.value, batchType.value)
   ElMessage.success(`已把 ${selectedIds.value.length} 个单位的类型调整为「${batchType.value}」`)
 }
+
+/** 按探方校正深度（更换水准点后的整体平移） */
+const shiftDialogVisible = ref(false)
+const shiftTrenchId = ref('')
+const shiftOffset = ref<number>(0)
+
+/** 实时预览：调整后的深度范围、受影响出土物、地表与跨探方关系校验 */
+const shiftPreview = computed(() => {
+  if (!shiftTrenchId.value || !shiftOffset.value) return null
+  return previewTrenchShift(
+    stratumState.strata,
+    artifactState.artifacts,
+    relationState.relations,
+    shiftTrenchId.value,
+    shiftOffset.value
+  )
+})
+
+function openShift(): void {
+  shiftTrenchId.value = filterTrenchId.value || trenchState.trenches[0]?.id || ''
+  shiftOffset.value = 0
+  shiftDialogVisible.value = true
+}
+
+async function applyShift(): Promise<void> {
+  const preview = shiftPreview.value
+  if (!preview) return
+  if (!preview.applicable) {
+    ElMessage.error('校正被拒绝：存在低于地表的深度或跨探方关系矛盾，请调整平移量')
+    return
+  }
+  const label = trenchLabel(preview.trenchId)
+  await stratumStore.getState().shiftDepthsByTrench(preview.trenchId, preview.offset)
+  ElMessage.success(
+    `已按探方「${label}」整体平移 ${preview.offset} m：${preview.strata.length} 个地层单位、${preview.artifacts.length} 件出土物同步更新`
+  )
+  shiftDialogVisible.value = false
+}
 </script>
 
 <template>
@@ -204,9 +243,14 @@ async function applyBatchType(): Promise<void> {
           按类型与深度区间筛选；层序倒置（上界大于下界）与同一探方内单位号重复即时高亮提示，深度刻度条展示厚度。
         </p>
       </div>
-      <el-button type="primary" @click="openCreate">
-        <el-icon><Plus /></el-icon>新建地层单位
-      </el-button>
+      <div class="head-actions">
+        <el-button @click="openShift">
+          <el-icon><Switch /></el-icon>按探方校正深度
+        </el-button>
+        <el-button type="primary" @click="openCreate">
+          <el-icon><Plus /></el-icon>新建地层单位
+        </el-button>
+      </div>
     </div>
 
     <el-alert
@@ -392,12 +436,143 @@ async function applyBatchType(): Promise<void> {
         <el-button type="primary" @click="submit">保存</el-button>
       </template>
     </el-dialog>
+
+    <el-dialog v-model="shiftDialogVisible" title="按探方校正深度（更换水准点）" width="780px">
+      <el-form label-width="110px">
+        <el-row :gutter="12">
+          <el-col :span="12">
+            <el-form-item label="探方" required>
+              <el-select v-model="shiftTrenchId" style="width: 100%">
+                <el-option
+                  v-for="trench in trenchState.trenches"
+                  :key="trench.id"
+                  :label="`${trench.area} · ${trench.code}`"
+                  :value="trench.id"
+                />
+              </el-select>
+            </el-form-item>
+          </el-col>
+          <el-col :span="12">
+            <el-form-item label="平移量（米）" required>
+              <el-input-number v-model="shiftOffset" :step="0.05" :precision="2" :controls="false" style="width: 100%" />
+            </el-form-item>
+          </el-col>
+        </el-row>
+        <p class="shift-hint muted">
+          正值整体加深、负值整体抬升；该探方全部地层上下界与出土物 Z 值同步平移，其他探方与层位关系保持不变。
+        </p>
+      </el-form>
+
+      <template v-if="shiftPreview">
+        <el-alert
+          v-if="shiftPreview.strata.length === 0"
+          class="shift-alert"
+          type="info"
+          :closable="false"
+          show-icon
+          title="该探方下暂无地层单位，无需校正"
+        />
+        <template v-else>
+          <el-alert
+            v-if="shiftPreview.surfaceViolations.length > 0"
+            class="shift-alert"
+            type="error"
+            :closable="false"
+            show-icon
+            title="校正后以下深度将低于地表，无法执行"
+          >
+            <template #default>
+              <p v-for="item in shiftPreview.surfaceViolations" :key="`${item.kind}-${item.id}-${item.label}`">
+                {{ item.label }}：校正后为 {{ item.depth }} m（低于地表）
+              </p>
+            </template>
+          </el-alert>
+          <el-alert
+            v-if="shiftPreview.conflicts.length > 0"
+            class="shift-alert"
+            type="error"
+            :closable="false"
+            show-icon
+            title="校正将导致跨探方层位关系矛盾，无法执行"
+          >
+            <template #default>
+              <p v-for="item in shiftPreview.conflicts" :key="item.relationId">
+                {{ item.aCode }}（{{ trenchLabel(item.aTrenchId) }}）{{ item.type }}
+                {{ item.bCode }}（{{ trenchLabel(item.bTrenchId) }}），但校正后 {{ item.aCode }} 上界
+                {{ item.aTopDepth }} m 深于 {{ item.bCode }} 上界 {{ item.bTopDepth }} m，层位关系与深度矛盾
+              </p>
+            </template>
+          </el-alert>
+          <el-alert
+            v-if="shiftPreview.applicable"
+            class="shift-alert"
+            type="success"
+            :closable="false"
+            show-icon
+            title="校验通过：无低于地表的深度，无跨探方关系矛盾，可确认执行"
+          />
+
+          <h4 class="shift-sub">调整后深度范围（{{ shiftPreview.strata.length }} 个地层单位）</h4>
+          <el-table :data="shiftPreview.strata" border stripe max-height="220" size="small">
+            <el-table-column label="单位号" width="100">
+              <template #default="{ row }">
+                <span class="mono">{{ row.stratum.code }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="类型" width="90">
+              <template #default="{ row }">{{ row.stratum.type }}</template>
+            </el-table-column>
+            <el-table-column label="原深度区间（m）" width="150">
+              <template #default="{ row }">{{ row.stratum.topDepth }} – {{ row.stratum.bottomDepth }}</template>
+            </el-table-column>
+            <el-table-column label="调整后深度区间（m）" min-width="160">
+              <template #default="{ row }">
+                <span class="mono shift-new">{{ row.newTopDepth }} – {{ row.newBottomDepth }}</span>
+              </template>
+            </el-table-column>
+          </el-table>
+
+          <h4 class="shift-sub">受影响出土物（{{ shiftPreview.artifacts.length }} 条记录）</h4>
+          <el-table v-if="shiftPreview.artifacts.length > 0" :data="shiftPreview.artifacts" border stripe max-height="220" size="small">
+            <el-table-column label="器物编号" width="140">
+              <template #default="{ row }">
+                <span class="mono">{{ row.artifact.code }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="所属单位" width="100">
+              <template #default="{ row }">{{ row.stratumCode }}</template>
+            </el-table-column>
+            <el-table-column label="原 Z 深度（m）" width="130">
+              <template #default="{ row }">{{ row.artifact.z }}</template>
+            </el-table-column>
+            <el-table-column label="调整后 Z 深度（m）" min-width="140">
+              <template #default="{ row }">
+                <span class="mono shift-new">{{ row.newZ }}</span>
+              </template>
+            </el-table-column>
+          </el-table>
+          <p v-else class="muted shift-none">该探方暂无出土物记录，仅更新地层深度。</p>
+        </template>
+      </template>
+      <p v-else class="muted">请填写非零平移量，下方将实时列出调整后的深度范围与受影响出土物。</p>
+
+      <template #footer>
+        <el-button @click="shiftDialogVisible = false">取消</el-button>
+        <el-button type="primary" :disabled="!shiftPreview || !shiftPreview.applicable" @click="applyShift">
+          确认执行校正
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <style scoped>
 .alert {
   margin-bottom: 14px;
+}
+.head-actions {
+  display: flex;
+  gap: 10px;
 }
 .depth {
   display: flex;
@@ -410,6 +585,26 @@ async function applyBatchType(): Promise<void> {
 .warn {
   margin: 0;
   color: #c0392b;
+  font-size: 12px;
+}
+.shift-hint {
+  margin: 0 0 6px;
+  font-size: 12px;
+}
+.shift-alert {
+  margin-bottom: 10px;
+}
+.shift-sub {
+  margin: 12px 0 6px;
+  font-size: 13px;
+  color: #4a5a6a;
+}
+.shift-new {
+  color: #b3401f;
+  font-weight: 600;
+}
+.shift-none {
+  margin: 4px 0 0;
   font-size: 12px;
 }
 </style>
