@@ -12,6 +12,7 @@ import { trenchStore } from '@/stores/trenchStore'
 import { artifactStore } from '@/stores/artifactStore'
 import { relationStore } from '@/stores/relationStore'
 import { uid } from '@/utils/id'
+import { buildDepthShiftPreview, type ArtifactShiftRow, type DepthShiftPreview, type RelationConflict, type StratumShiftRow } from '@/utils/depthShift'
 
 const trenchState = useStore(trenchStore)
 const stratumState = useStore(stratumStore)
@@ -193,6 +194,77 @@ async function applyBatchType(): Promise<void> {
   await stratumStore.getState().bulkSetType(selectedIds.value, batchType.value)
   ElMessage.success(`已把 ${selectedIds.value.length} 个单位的类型调整为「${batchType.value}」`)
 }
+
+/* —— 按探方整体校正深度 —— */
+
+const shiftDialogVisible = ref(false)
+const shiftTrenchId = ref('')
+const shiftDelta = ref(0)
+
+const shiftPreview = computed<DepthShiftPreview | null>(() => {
+  if (!shiftDialogVisible.value || !shiftTrenchId.value) return null
+  return buildDepthShiftPreview(
+    shiftTrenchId.value,
+    Number(shiftDelta.value) || 0,
+    stratumState.strata,
+    artifactState.artifacts,
+    relationState.relations
+  )
+})
+
+const shiftCanApply = computed(
+  () =>
+    shiftPreview.value !== null &&
+    shiftPreview.value.stratumRows.length > 0 &&
+    !shiftPreview.value.blocked &&
+    (Number(shiftDelta.value) || 0) !== 0
+)
+
+function openShiftDialog(): void {
+  if (trenchState.trenches.length === 0) {
+    ElMessage.warning('请先登记探方，再进行深度校正')
+    return
+  }
+  shiftTrenchId.value = filterTrenchId.value || trenchState.trenches[0].id
+  shiftDelta.value = 0
+  shiftDialogVisible.value = true
+}
+
+function stratumCodeById(id: string): string {
+  return stratumState.strata.find((item) => item.id === id)?.code ?? '未知单位'
+}
+
+function surfaceText(rows: StratumShiftRow[]): string {
+  return rows
+    .map((row) => `${row.stratum.code}（上界 ${row.newTopDepth} m、下界 ${row.newBottomDepth} m）`)
+    .join('；')
+}
+
+function artifactSurfaceText(rows: ArtifactShiftRow[]): string {
+  return rows.map((row) => `${row.artifact.code}（Z ${row.newZ} m）`).join('；')
+}
+
+function conflictText(conflict: RelationConflict): string {
+  const shiftedLabel = trenchLabel(conflict.shiftedStratum.trenchId)
+  const otherLabel = trenchLabel(conflict.otherStratum.trenchId)
+  return `${conflict.shiftedStratum.code}（${shiftedLabel}）${conflict.relation.type} ${conflict.otherStratum.code}（${otherLabel}）：校正后 ${conflict.shiftedStratum.code} 上界将深于 ${conflict.otherStratum.code}`
+}
+
+async function confirmShift(): Promise<void> {
+  const preview = shiftPreview.value
+  if (!preview || !shiftCanApply.value) return
+  await ElMessageBox.confirm(
+    `将把「${trenchLabel(preview.trenchId)}」整体${preview.delta > 0 ? '加深' : '上移'} ${Math.abs(
+      preview.delta
+    )} m：${preview.stratumRows.length} 个地层单位与 ${preview.artifactRows.length} 件出土物同步更新，其他探方和层位关系不变。确认执行？`,
+    '执行校正确认',
+    { type: 'warning', confirmButtonText: '确认执行', cancelButtonText: '再核对一下' }
+  )
+  const result = await stratumStore.getState().shiftTrenchDepths(preview.trenchId, preview.delta)
+  await artifactStore.getState().hydrate()
+  shiftDialogVisible.value = false
+  ElMessage.success(`校正完成：${result.strata} 个地层单位、${result.artifacts} 件出土物的深度已同步更新`)
+}
 </script>
 
 <template>
@@ -204,9 +276,14 @@ async function applyBatchType(): Promise<void> {
           按类型与深度区间筛选；层序倒置（上界大于下界）与同一探方内单位号重复即时高亮提示，深度刻度条展示厚度。
         </p>
       </div>
-      <el-button type="primary" @click="openCreate">
-        <el-icon><Plus /></el-icon>新建地层单位
-      </el-button>
+      <div class="head-actions">
+        <el-button plain @click="openShiftDialog">
+          <el-icon><ScaleToOriginal /></el-icon>按探方校正深度
+        </el-button>
+        <el-button type="primary" @click="openCreate">
+          <el-icon><Plus /></el-icon>新建地层单位
+        </el-button>
+      </div>
     </div>
 
     <el-alert
@@ -392,12 +469,188 @@ async function applyBatchType(): Promise<void> {
         <el-button type="primary" @click="submit">保存</el-button>
       </template>
     </el-dialog>
+
+    <el-dialog v-model="shiftDialogVisible" title="按探方整体校正地层深度" width="860px">
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        title="更换工地水准点后使用：选中探方的全部地层单位与其下出土物按同一平移量更新深度。"
+        description="平移量为正表示整体加深、为负表示上移；先试算确认调整后的深度范围与受影响出土物，再执行。任何深度不得低于地表；若会造成跨探方层位关系矛盾则拒绝执行。"
+        class="alert"
+      />
+      <el-form label-width="110px" class="shift-form">
+        <el-row :gutter="12">
+          <el-col :span="12">
+            <el-form-item label="选择探方" required>
+              <el-select v-model="shiftTrenchId" style="width: 100%">
+                <el-option
+                  v-for="trench in trenchState.trenches"
+                  :key="trench.id"
+                  :label="`${trench.area} · ${trench.code}`"
+                  :value="trench.id"
+                />
+              </el-select>
+            </el-form-item>
+          </el-col>
+          <el-col :span="12">
+            <el-form-item label="深度平移量(m)" required>
+              <el-input-number
+                v-model="shiftDelta"
+                :step="0.05"
+                :precision="2"
+                :controls="false"
+                style="width: 100%"
+                placeholder="正数加深，负数上移"
+              />
+            </el-form-item>
+          </el-col>
+        </el-row>
+      </el-form>
+
+      <template v-if="shiftPreview">
+        <el-alert
+          v-if="shiftPreview.stratumRows.length === 0"
+          type="warning"
+          :closable="false"
+          show-icon
+          class="alert"
+          title="该探方下还没有地层单位，无可校正的深度"
+        />
+        <el-alert
+          v-else-if="shiftPreview.surfaceViolations.length > 0"
+          type="error"
+          :closable="false"
+          show-icon
+          class="alert"
+          title="校正被拒绝：以下地层单位调整后深度将低于地表（0 m）"
+        >
+          <span>{{ surfaceText(shiftPreview.surfaceViolations) }}</span>
+        </el-alert>
+        <el-alert
+          v-if="shiftPreview.artifactSurfaceViolations.length > 0"
+          type="error"
+          :closable="false"
+          show-icon
+          class="alert"
+          title="校正被拒绝：以下出土物调整后出土深度将低于地表（0 m）"
+        >
+          <span>{{ artifactSurfaceText(shiftPreview.artifactSurfaceViolations) }}</span>
+        </el-alert>
+        <el-alert
+          v-if="shiftPreview.relationConflicts.length > 0"
+          type="error"
+          :closable="false"
+          show-icon
+          class="alert"
+          title="校正被拒绝：将造成跨探方层位关系矛盾，请先处理下列冲突记录"
+        >
+          <div v-for="(conflict, index) in shiftPreview.relationConflicts" :key="conflict.relation.id">
+            {{ index + 1 }}. 关系记录「{{ stratumCodeById(conflict.relation.unitAId) }} {{ conflict.relation.type }}
+            {{ stratumCodeById(conflict.relation.unitBId) }}」——{{ conflictText(conflict) }}
+          </div>
+        </el-alert>
+        <el-alert
+          v-else-if="shiftPreview.delta === 0"
+          type="warning"
+          :closable="false"
+          show-icon
+          class="alert"
+          title="请填写非零的深度平移量"
+        />
+        <el-alert
+          v-else
+          type="success"
+          :closable="false"
+          show-icon
+          class="alert"
+          :title="`试算通过：${shiftPreview.stratumRows.length} 个地层单位、${shiftPreview.artifactRows.length} 件出土物将同步更新，其他探方和层位关系不变`"
+        />
+
+        <h4 class="shift-section">调整后的深度范围（{{ shiftPreview.stratumRows.length }} 个单位）</h4>
+        <el-table :data="shiftPreview.stratumRows" border stripe size="small" max-height="240" row-key="stratum.id">
+          <el-table-column label="单位号" width="100">
+            <template #default="{ row }: { row: StratumShiftRow }">
+              <span class="mono">{{ row.stratum.code }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="类型" width="90">
+            <template #default="{ row }: { row: StratumShiftRow }">
+              <TrenchTag :unit-type="row.stratum.type" size="small" />
+            </template>
+          </el-table-column>
+          <el-table-column label="调整前深度(m)" width="150">
+            <template #default="{ row }: { row: StratumShiftRow }">
+              {{ row.stratum.topDepth.toFixed(2) }} – {{ row.stratum.bottomDepth.toFixed(2) }}
+            </template>
+          </el-table-column>
+          <el-table-column label="调整后深度(m)" width="160">
+            <template #default="{ row }: { row: StratumShiftRow }">
+              <span :class="{ 'bad-depth': row.newTopDepth < 0 || row.newBottomDepth < 0 }">
+                {{ row.newTopDepth.toFixed(2) }} – {{ row.newBottomDepth.toFixed(2) }}
+              </span>
+            </template>
+          </el-table-column>
+          <el-table-column label="厚度(m)" width="100">
+            <template #default="{ row }: { row: StratumShiftRow }">
+              {{ stratumThickness(row.stratum).toFixed(2) }}
+            </template>
+          </el-table-column>
+        </el-table>
+
+        <h4 class="shift-section">受影响出土物（{{ shiftPreview.artifactRows.length }} 件，Z 深度同量平移）</h4>
+        <el-table :data="shiftPreview.artifactRows" border stripe size="small" max-height="240" row-key="artifact.id">
+          <el-table-column prop="artifact.code" label="器物编号" width="150" />
+          <el-table-column label="所属单位" width="110">
+            <template #default="{ row }: { row: ArtifactShiftRow }">
+              <span class="mono">{{ row.stratum.code }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="调整前 Z(m)" width="120">
+            <template #default="{ row }: { row: ArtifactShiftRow }">{{ row.artifact.z.toFixed(2) }}</template>
+          </el-table-column>
+          <el-table-column label="调整后 Z(m)" width="120">
+            <template #default="{ row }: { row: ArtifactShiftRow }">
+              <span :class="{ 'bad-depth': row.newZ < 0 }">{{ row.newZ.toFixed(2) }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column prop="artifact.category" label="类别" width="90" />
+          <el-table-column prop="artifact.count" label="件数" width="70" />
+        </el-table>
+        <p v-if="shiftPreview.artifactRows.length === 0" class="muted shift-empty">该探方当前没有挂接地层单位的出土物。</p>
+      </template>
+
+      <template #footer>
+        <el-button @click="shiftDialogVisible = false">取消</el-button>
+        <el-button type="primary" :disabled="!shiftCanApply" @click="confirmShift">确认执行校正</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <style scoped>
 .alert {
   margin-bottom: 14px;
+}
+.head-actions {
+  display: flex;
+  gap: 10px;
+}
+.shift-form {
+  margin: 14px 0 4px;
+}
+.shift-section {
+  margin: 16px 0 8px;
+  font-size: 14px;
+  color: #3a3a3a;
+}
+.shift-empty {
+  margin: 8px 0 0;
+  font-size: 12px;
+}
+.bad-depth {
+  color: #c0392b;
+  font-weight: 600;
 }
 .depth {
   display: flex;
